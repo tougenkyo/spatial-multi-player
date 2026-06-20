@@ -23,6 +23,7 @@ def _bootstrap() -> None:
     """
     REQUIRED = [
         ("numpy",       "numpy"),
+        ("scipy",       "scipy"),
         ("sounddevice", "sounddevice"),
         ("soundfile",   "soundfile"),
         ("tkinterdnd2", "tkinterdnd2"),
@@ -422,15 +423,26 @@ def check_and_setup_ffmpeg(parent) -> bool:
 # 音声読み込み
 # ──────────────────────────────────────────────────────
 
+_ffmpeg_verified_cache: Optional[str] = None
+
+
 def _read_via_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
+    global _ffmpeg_verified_cache
     exe = get_ffmpeg_path()
     if exe is None:
         raise RuntimeError("FFmpeg が見つかりません。")
-    if not verify_ffmpeg(exe):
-        raise RuntimeError(f"FFmpeg の実行に失敗しました: {exe}")
+    # verify は一度成功したら再実行しない（毎回の -version 起動コストを削減）
+    if _ffmpeg_verified_cache != exe:
+        if not verify_ffmpeg(exe):
+            raise RuntimeError(f"FFmpeg の実行に失敗しました: {exe}")
+        _ffmpeg_verified_cache = exe
+
     TARGET_SR = 44100
+    # モノラル(-ac 1)で直接デコードする。
+    # どのみち mono = raw.mean(...) でモノラル化するため、
+    # 1ch で読めばデータ量・転送量・後段の mean 処理がすべて半減する。
     cmd = [exe, "-y", "-i", str(path), "-vn",
-           "-ar", str(TARGET_SR), "-ac", "2", "-f", "f32le", "pipe:1"]
+           "-ar", str(TARGET_SR), "-ac", "1", "-f", "f32le", "pipe:1"]
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     except subprocess.TimeoutExpired as exc:
@@ -442,7 +454,8 @@ def _read_via_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
         raise RuntimeError(f"FFmpeg デコード失敗 (code {result.returncode}):\n{err_tail}")
     if len(result.stdout) == 0:
         raise RuntimeError(f"FFmpeg の出力が空でした: {path.name}")
-    return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, 2), TARGET_SR
+    # モノラル1次元配列を (N, 1) にして返す
+    return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, 1), TARGET_SR
 
 
 def read_audio(path: Path) -> tuple[np.ndarray, int]:
@@ -469,73 +482,81 @@ def _apply_rear_lpf(signal: np.ndarray, rear_amount: float, sr: int) -> np.ndarr
     rear_amount: 0.0（真正面）〜 1.0（真後方）
     後方ほど高域が減衰し「こもった感じ」になる。
 
-    scipy を使わず numpy で実装することで：
-    ・チャンク処理で zi 状態を持つ必要がない
-    ・金属音（位相歪み・コムフィルター）が発生しない
-    ・バッファ全体に一括適用するためクリックが出ない
+    scipy.signal.lfilter でベクトル化することで、
+    大きなファイル（数千万サンプル）でも高速に処理する。
+    1次フィルターなので金属音（位相歪み）は発生しない。
     """
     if rear_amount < 0.05:
         return signal
 
-    # カットオフ周波数: 前方 = ほぼ素通し / 後方 = 4000Hz 程度
-    # RC フィルター係数 α = dt / (RC + dt), dt = 1/sr
     cutoff_hz = 16000 - rear_amount * 12000   # 16kHz〜4kHz
     rc = 1.0 / (2.0 * np.pi * cutoff_hz)
     dt = 1.0 / sr
-    alpha = float(dt / (rc + dt))            # 0 に近いほどカット強い
+    alpha = float(dt / (rc + dt))
 
     # 1次 IIR: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
-    # numpy の cumsum を使ったベクトル実装（ループなしで高速）
-    # 参考: y = α * x の累積和を (1-α)^k で重み付けすると等価
-    out = np.empty_like(signal)
-    prev = signal[0]
-    beta = 1.0 - alpha
-    for i in range(len(signal)):
-        prev = alpha * signal[i] + beta * prev
-        out[i] = prev
-    return out.astype(np.float32)
+    # 伝達関数 b=[alpha], a=[1, -(1-alpha)]
+    from scipy.signal import lfilter
+    b = [alpha]
+    a = [1.0, -(1.0 - alpha)]
+    return lfilter(b, a, signal).astype(np.float32)
 
 
-def compute_stereo(
-    mono:   np.ndarray,
-    pos:    BinauralPosition,
-    volume: int,
-    sr:     int = 44100,
-) -> np.ndarray:
+def _compute_params(pos: BinauralPosition, volume: int, sr: int) -> dict:
     """
-    モノラル音声をステレオに変換する。
-
-    左右定位: sin(アジマス) によるゲイン差
-    前後定位:
-      ・後方（|az| > 90°）は音量を最大 20% 下げる
-      ・後方は高域を緩やかにカット（1次 IIR LPF、金属音なし）
-    これにより -20° と -160° の聞こえ方が異なるようになる。
+    位置・音量から再生パラメータを計算する（軽量・配列処理なし）。
+    実際のゲイン適用・LPF はチャンク単位で行う。
     """
     az   = np.radians(np.clip(pos.azimuth, -180, 180))
     dist = max(0.05, pos.distance)
 
-    # ── 左右パンニング ──────────────────────────────
     pan_r = float(np.clip(0.5 + 0.5 * np.sin(az), 0.0, 1.0))
     pan_l = float(np.clip(0.5 - 0.5 * np.sin(az), 0.0, 1.0))
-
     dist_gain = float(np.clip(_REF_DIST / dist, 0.1, 3.0)) * (volume / 100.0)
 
-    # ── 前後判定 ────────────────────────────────────
-    # cos(az): 前方=+1, 真横=0, 後方=-1
-    cos_az = float(np.cos(az))
-    # rear_amount: 0（前方・真横）〜 1（真後方）
-    rear_amount = float(np.clip(-cos_az, 0.0, 1.0))
+    # 前後判定: cos(az) 前方=+1 後方=-1
+    rear_amount = float(np.clip(-np.cos(az), 0.0, 1.0))
+    rear_vol = 1.0 - rear_amount * 0.20
 
-    # ── 後方の音量減衰（後方ほど小さく聞こえる）────
-    rear_vol_factor = 1.0 - rear_amount * 0.20   # 最大 20% 減
+    # LPF 係数（後方ほど高域カット）
+    if rear_amount < 0.05:
+        alpha = 1.0   # 素通し
+    else:
+        cutoff_hz = 16000 - rear_amount * 12000
+        rc = 1.0 / (2.0 * np.pi * cutoff_hz)
+        dt = 1.0 / sr
+        alpha = float(dt / (rc + dt))
 
-    # ── 後方の高域カット（こもり感）────────────────
-    processed = _apply_rear_lpf(mono, rear_amount, sr)
+    return {
+        "l_gain": pan_l * dist_gain * rear_vol,
+        "r_gain": pan_r * dist_gain * rear_vol,
+        "alpha":  alpha,
+    }
 
-    l_out = (processed * pan_l * dist_gain * rear_vol_factor).astype(np.float32)
-    r_out = (processed * pan_r * dist_gain * rear_vol_factor).astype(np.float32)
 
-    return np.column_stack([l_out, r_out])
+def _apply_lpf_chunk(chunk: np.ndarray, alpha: float, state: float) -> tuple[np.ndarray, float]:
+    """
+    チャンクに 1次 IIR LPF を適用し、新しい状態を返す。
+    alpha=1.0 のときは素通し（前方）。
+    scipy.lfilter で zi（初期状態）を渡してチャンク境界を連続させる。
+    """
+    if alpha >= 0.999:
+        return chunk, chunk[-1] if len(chunk) else state
+    from scipy.signal import lfilter
+    b = [alpha]
+    a = [1.0, -(1.0 - alpha)]
+    zi = [state * (1.0 - alpha)]
+    out, zf = lfilter(b, a, chunk, zi=zi)
+    return out.astype(np.float32), float(out[-1]) if len(out) else state
+
+
+# 互換のため残す（外部から呼ばれないが定義は維持）
+def compute_stereo(mono: np.ndarray, pos: BinauralPosition, volume: int, sr: int = 44100) -> np.ndarray:
+    p = _compute_params(pos, volume, sr)
+    processed = _apply_rear_lpf(mono, float(np.clip(-np.cos(np.radians(pos.azimuth)), 0, 1)), sr)
+    l = (processed * p["l_gain"]).astype(np.float32)
+    r = (processed * p["r_gain"]).astype(np.float32)
+    return np.column_stack([l, r])
 
 
 # ──────────────────────────────────────────────────────
@@ -554,20 +575,39 @@ class AudioEngine:
         self.is_playing = False
         self.is_loading = False
         self._stream: Optional[sd.OutputStream] = None
-        self._data: Optional[np.ndarray] = None   # stereo float32
-        self._mono: Optional[np.ndarray] = None   # mono source（update_position 用）
+        self._data: Optional[np.ndarray] = None   # 互換のため残す（未使用）
+        self._mono: Optional[np.ndarray] = None   # mono source（非ストリーミング時）
+        self._params: dict = {"l_gain": 0.5, "r_gain": 0.5, "alpha": 1.0}
+        self._lpf_state: float = 0.0
         self._samplerate: int = 44100
         self._pos: int = 0
-        # リアルタイム更新用ゲイン（位置変更で差し替え）
         self._l_gain: float = 0.5
         self._r_gain: float = 0.5
+        # ストリーミング再生用
+        self._stream_mode: bool = False
+        self._ffmpeg_proc = None
+        self._ring: list = []          # デコード済みモノラルチャンクのキュー
+        self._ring_lock = threading.Lock()
+        self._leftover = np.zeros(0, dtype=np.float32)
+        self._eof = False
+        self._reader_thread = None
 
     def load(
         self, audio: AudioFile, pos: BinauralPosition,
         volume: int, speed: int,
     ) -> bool:
         self.is_loading = True
+        self._stream_mode = False
+        self._speed = speed
         try:
+            suffix = audio.path.suffix.lower()
+            # FFMPEG 系（MP3/AAC/OPUS）かつ速度100%ならストリーミング再生する
+            if suffix in FFMPEG_EXT and speed == 100:
+                ok = self._prepare_stream(audio.path, pos, volume)
+                self.is_loading = False
+                return ok
+
+            # それ以外は従来通り全体をデコード
             raw, sr = read_audio(audio.path)
         except Exception as exc:
             print(f"[AudioEngine] load failed: {exc}")
@@ -576,8 +616,6 @@ class AudioEngine:
 
         mono = raw.mean(axis=1).astype(np.float32)
 
-        # 速度変更: np.interp による線形リサンプリング
-        # librosa の phase vocoder は金属音（フェーズ歪み）を生じさせるため使用しない
         if speed != 100:
             factor  = speed / 100.0
             orig_len = len(mono)
@@ -586,36 +624,105 @@ class AudioEngine:
             xs_new   = np.linspace(0.0, orig_len - 1, new_len)
             mono     = np.interp(xs_new, xs_orig, mono).astype(np.float32)
 
-        stereo = compute_stereo(mono, pos, volume, sr)
+        params = _compute_params(pos, volume, sr)
 
         with self._lock:
             self._mono       = mono
-            self._data       = stereo
             self._samplerate = sr
+            self._params     = params
+            self._lpf_state  = 0.0
+            self._stream_mode = False
 
         self.is_loading = False
         return True
 
-    def update_position(self, pos: BinauralPosition, volume: int) -> None:
-        """再生中の位置・音量変更を次チャンクから反映する。"""
+    def _prepare_stream(self, path: Path, pos: BinauralPosition, volume: int) -> bool:
+        """FFmpeg をパイプ起動してストリーミング再生の準備をする。"""
+        global _ffmpeg_verified_cache
+        exe = get_ffmpeg_path()
+        if exe is None:
+            return False
+        if _ffmpeg_verified_cache != exe:
+            if not verify_ffmpeg(exe):
+                return False
+            _ffmpeg_verified_cache = exe
+
+        TARGET_SR = 44100
+        cmd = [exe, "-y", "-i", str(path), "-vn",
+               "-ar", str(TARGET_SR), "-ac", "1", "-f", "f32le", "pipe:1"]
+        try:
+            self._ffmpeg_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        except Exception as exc:
+            print(f"[AudioEngine] ffmpeg start failed: {exc}")
+            return False
+
         with self._lock:
-            if self._data is None or self._mono is None:
-                return
-            self._data = compute_stereo(self._mono, pos, volume, self._samplerate)
+            self._samplerate  = TARGET_SR
+            self._params      = _compute_params(pos, volume, TARGET_SR)
+            self._lpf_state   = 0.0
+            self._stream_mode = True
+            self._eof         = False
+            self._leftover    = np.zeros(0, dtype=np.float32)
+        with self._ring_lock:
+            self._ring = []
+
+        # バックグラウンドで FFmpeg 出力を読み続けるスレッドを起動
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+        return True
+
+    def _reader_loop(self) -> None:
+        """FFmpeg の標準出力を読み続けて ring キューに溜める。"""
+        CHUNK_BYTES = 4096 * 4   # 約 4096 サンプル分
+        proc = self._ffmpeg_proc
+        if proc is None:
+            return
+        try:
+            while True:
+                data = proc.stdout.read(CHUNK_BYTES)
+                if not data:
+                    break
+                arr = np.frombuffer(data, dtype="<f4")
+                with self._ring_lock:
+                    self._ring.append(arr)
+        except Exception:
+            pass
+        finally:
+            with self._lock:
+                self._eof = True
+
+    def update_position(self, pos: BinauralPosition, volume: int) -> None:
+        with self._lock:
+            self._params = _compute_params(pos, volume, self._samplerate)
 
     def play(self) -> None:
-        if self._data is None:
+        if not self._stream_mode and self._mono is None:
             return
-        self.stop()
+        self.stop_stream_only()
         with self._lock:
             self._pos       = 0
+            self._lpf_state = 0.0
             self.is_playing = True
         self._stream = sd.OutputStream(
             samplerate=self._samplerate, channels=2, dtype="float32",
             callback=self._stream_callback,
             finished_callback=self._on_stream_finished,
+            blocksize=2048,
         )
         self._stream.start()
+
+    def stop_stream_only(self) -> None:
+        """既存の OutputStream だけ止める（ffmpeg は残す）。"""
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
 
     def stop(self) -> None:
         with self._lock:
@@ -628,19 +735,93 @@ class AudioEngine:
                 pass
             self._stream = None
 
-    def _stream_callback(self, outdata, frames, time, status) -> None:
+    def stop(self) -> None:
         with self._lock:
-            if not self.is_playing or self._data is None:
+            self.is_playing = False
+        self.stop_stream_only()
+        # ffmpeg プロセスを終了する
+        if self._ffmpeg_proc is not None:
+            try:
+                self._ffmpeg_proc.kill()
+            except Exception:
+                pass
+            self._ffmpeg_proc = None
+        with self._ring_lock:
+            self._ring = []
+
+    def _get_stream_chunk(self, frames: int) -> tuple[np.ndarray, bool]:
+        """
+        ストリーミングモードで frames サンプル分のモノラルデータを取り出す。
+        返り値: (データ, 終端フラグ)
+        """
+        # leftover + ring から frames 分を集める
+        parts = [self._leftover] if len(self._leftover) else []
+        have = len(self._leftover)
+        with self._ring_lock:
+            while have < frames and self._ring:
+                arr = self._ring.pop(0)
+                parts.append(arr)
+                have += len(arr)
+            ring_empty = len(self._ring) == 0
+        if parts:
+            buf = np.concatenate(parts)
+        else:
+            buf = np.zeros(0, dtype=np.float32)
+
+        if len(buf) >= frames:
+            out = buf[:frames]
+            self._leftover = buf[frames:]
+            return out, False
+        else:
+            # データ不足
+            self._leftover = np.zeros(0, dtype=np.float32)
+            if self._eof and ring_empty:
+                # 本当に終端：残りをゼロ埋めして終了
+                pad = np.zeros(frames - len(buf), dtype=np.float32)
+                return np.concatenate([buf, pad]), True
+            else:
+                # まだデコード中：あるだけ返してゼロ埋め（音切れ防止）
+                pad = np.zeros(frames - len(buf), dtype=np.float32)
+                return np.concatenate([buf, pad]), False
+
+    def _stream_callback(self, outdata, frames, time, status) -> None:
+        # パラメータをスナップショットで取得（lock 保持時間を最小化）
+        with self._lock:
+            if not self.is_playing:
                 outdata[:] = 0
                 raise sd.CallbackStop()
+            p = self._params
+            stream_mode = self._stream_mode
+            lpf_state = self._lpf_state
 
-            remaining = len(self._data) - self._pos
+        if stream_mode:
+            mono_chunk, ended = self._get_stream_chunk(frames)
+            filtered, lpf_state = _apply_lpf_chunk(mono_chunk, p["alpha"], lpf_state)
+            outdata[:, 0] = filtered * p["l_gain"]
+            outdata[:, 1] = filtered * p["r_gain"]
+            with self._lock:
+                self._lpf_state = lpf_state
+                if ended:
+                    self.is_playing = False
+            if ended:
+                raise sd.CallbackStop()
+            return
+
+        # 非ストリーミング（全体デコード済み）
+        with self._lock:
+            if self._mono is None:
+                outdata[:] = 0
+                raise sd.CallbackStop()
+            remaining = len(self._mono) - self._pos
             chunk     = min(frames, remaining)
-
-            outdata[:chunk] = self._data[self._pos: self._pos + chunk]
+            mono_chunk = self._mono[self._pos: self._pos + chunk]
+            filtered, self._lpf_state = _apply_lpf_chunk(
+                mono_chunk, p["alpha"], self._lpf_state
+            )
+            outdata[:chunk, 0] = filtered * p["l_gain"]
+            outdata[:chunk, 1] = filtered * p["r_gain"]
             if chunk < frames:
                 outdata[chunk:] = 0
-
             self._pos += chunk
             if remaining <= frames:
                 self.is_playing = False
@@ -698,23 +879,30 @@ class PositionCanvas(tk.Canvas):
     SIZE   = 158
     RADIUS = 66
 
-    def __init__(self, parent, az_var, dist_var, az_rnd_var=None) -> None:
+    def __init__(self, parent, az_var, dist_var, az_rnd_var=None, on_release=None) -> None:
         super().__init__(parent, width=self.SIZE, height=self.SIZE,
                          bg="#10101e", highlightthickness=1, highlightbackground="#555",
                          cursor="crosshair")
         self._az_var     = az_var
         self._dist_var   = dist_var
         self._az_rnd_var = az_rnd_var  # 変動幅（扇形表示に使用）
+        self._on_release = on_release  # ドラッグ終了時のコールバック
         self._cx = self.SIZE // 2
         self._cy = self.SIZE // 2
         self._draw_grid()
         self.update_marker()
         self.bind("<Button-1>",  self._on_click)
         self.bind("<B1-Motion>", self._on_click)
+        self.bind("<ButtonRelease-1>", self._on_drag_release)
         az_var.trace_add(  "write", lambda *_: self.after(10, self.update_marker))
         dist_var.trace_add("write", lambda *_: self.after(10, self.update_marker))
         if az_rnd_var is not None:
             az_rnd_var.trace_add("write", lambda *_: self.after(10, self.update_marker))
+
+    def _on_drag_release(self, _event=None) -> None:
+        """ドラッグして指を離したときに再生位置を補正する。"""
+        if self._on_release is not None:
+            self._on_release()
 
     def _draw_grid(self) -> None:
         cx, cy, r = self._cx, self._cy, self.RADIUS
@@ -816,7 +1004,7 @@ DEFAULT_RND  = 0
 DEFAULT_AZ   = {"left": -45.0, "right": 45.0}
 POLL_MS      = 150
 WINDOW_SIZE  = "1040x780"
-APP_VERSION  = "1.0.1"
+APP_VERSION  = "1.0.2"
 
 
 class PlayerPanel(tk.Frame):
@@ -922,7 +1110,8 @@ class PlayerPanel(tk.Frame):
         left_col = tk.Frame(pos_cols)
         left_col.pack(side=tk.LEFT, fill=tk.Y)
 
-        self._pos_canvas = PositionCanvas(left_col, self._az_var, self._dist_var, self._az_rnd)
+        self._pos_canvas = PositionCanvas(left_col, self._az_var, self._dist_var,
+                                          self._az_rnd, on_release=self._on_canvas_release)
         self._pos_canvas.pack(padx=(0, 4))
 
         az_row = tk.Frame(left_col)
@@ -1065,14 +1254,31 @@ class PlayerPanel(tk.Frame):
             var.trace_add("write", lambda *_: self._schedule_rt_update())
 
     def _schedule_rt_update(self) -> None:
+        # update_position が軽量になったため遅延を短くして即時性を高める
         if self._rt_update_job is not None:
             self.after_cancel(self._rt_update_job)
-        self._rt_update_job = self.after(30, self._apply_rt_update)
+        self._rt_update_job = self.after(5, self._apply_rt_update)
 
     def _apply_rt_update(self) -> None:
         self._rt_update_job = None
         if self._keep_playing or self.engine.is_playing:
             self.engine.update_position(self._current_position(), self._vol_var.get())
+            # 再生位置の◎マーカーも現在位置に更新する
+            self._pos_canvas.show_actual_pos(
+                float(self._az_var.get()), float(self._dist_var.get())
+            )
+
+    def _on_canvas_release(self) -> None:
+        """レーダーをドラッグして離したときに再生位置を即座に補正する。"""
+        if self._rt_update_job is not None:
+            self.after_cancel(self._rt_update_job)
+            self._rt_update_job = None
+        if self._keep_playing or self.engine.is_playing:
+            self.engine.update_position(self._current_position(), self._vol_var.get())
+            # ◎マーカーをドラッグ後の最終位置に更新する
+            self._pos_canvas.show_actual_pos(
+                float(self._az_var.get()), float(self._dist_var.get())
+            )
 
     def _current_position(self) -> BinauralPosition:
         return BinauralPosition(
@@ -1662,6 +1868,9 @@ class StereoWavPlayerApp:
         )
         panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0 if idx == 0 else 5, 5))
         self._panels.append(panel)
+        # ダークモード時は新規パネルにもテーマを適用する
+        if _CURRENT_THEME == "dark":
+            self._apply_dark(panel)
 
     def _on_panels_resize(self, _event=None) -> None:
         if self._closing:

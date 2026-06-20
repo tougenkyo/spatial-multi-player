@@ -1,4 +1,5 @@
 numpy
+scipy
 sounddevice
 soundfile
 tkinterdnd2
