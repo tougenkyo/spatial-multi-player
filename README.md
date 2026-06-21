@@ -7,6 +7,13 @@ A multi-channel audio player that plays multiple audio files independently with 
 
 ---
 
+## このツールの使い道 / How to use this tool
+
+Irodori-TTSやEmoji-TTSなどで作成した寝息や喘ぎ声をヘッドフォンの片方に寄せて再生できます
+また複数チャンネルに対応しているのでハーレムを楽しんだり、左「イけ」右「イクな」の囁きを設定して楽しめます
+
+---
+
 ## 特徴 / Features
 
 - **マルチチャンネル独立再生** — 複数の音声ファイルをそれぞれ独立したチャンネルで再生（チャンネル数は自由に変更可能）
