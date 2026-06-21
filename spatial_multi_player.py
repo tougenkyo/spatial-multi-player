@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-binaural_player.py  -  Spatial Multi Player
+spatial_multi_player.py  -  Spatial Multi Player
 対応フォーマット: WAV / FLAC / OGG / AIFF / MP3 / AAC(M4A) / OPUS
 """
 from __future__ import annotations
@@ -1004,7 +1004,7 @@ DEFAULT_RND  = 0
 DEFAULT_AZ   = {"left": -45.0, "right": 45.0}
 POLL_MS      = 150
 WINDOW_SIZE  = "1040x780"
-APP_VERSION  = "1.0.2"
+APP_VERSION  = "1.0.5"
 
 
 class PlayerPanel(tk.Frame):
@@ -1031,6 +1031,7 @@ class PlayerPanel(tk.Frame):
         self._current_idx    = 0
         self._keep_playing   = False
         self._generation     = 0   # ポーリングチェーンの世代番号（ダブルクリック競合防止）
+        self._playing_marked_idx = None   # 再生中マーカーの位置
         self._play_mode      = PlayMode(saved.get("play_mode", PlayMode.SEQUENTIAL.value))
         self._root_ref       = root_ref
         self._rt_update_job: Optional[str] = None
@@ -1047,17 +1048,32 @@ class PlayerPanel(tk.Frame):
         self._vol_entry: Optional[tk.StringVar] = None  # Spinbox 表示値（保存に使う）
         self._spd_entry: Optional[tk.StringVar] = None
 
+        # チャンネル名（保存された custom_title があればそれを優先）
+        self._title_var = tk.StringVar(value=saved.get("custom_title", title))
+
         self._build_ui(title)
         self._register_drag_and_drop()
         self._register_rt_traces()
         self._restore_files(saved.get("files", []))
 
     def _build_ui(self, title: str) -> None:
-        tk.Label(self, text=title, font=("", 12, "bold")).pack(pady=(2, 4))
+        # タイトルラベル（ダブルクリックで編集可能）
+        self._title_label = tk.Label(
+            self, textvariable=self._title_var,
+            font=("", 12, "bold"), cursor="hand2",
+        )
+        self._title_label.pack(pady=(2, 4))
+        self._title_label.bind("<Double-Button-1>", self._edit_title)
+        # ホバー時に編集ヒントを表示する
+        self._title_label.bind("<Enter>",
+            lambda _e: self._title_label.config(fg="#1565C0"))
+        self._title_label.bind("<Leave>",
+            lambda _e: self._title_label.config(fg=_th("fg") if _CURRENT_THEME == "dark" else "#000000"))
 
         # ── ファイルリスト ────────────────────────────
         list_frame = tk.Frame(self)
         list_frame.pack(fill=tk.BOTH, expand=True)
+        self._list_frame = list_frame
 
         sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)
         self._file_listbox = tk.Listbox(
@@ -1249,6 +1265,28 @@ class PlayerPanel(tk.Frame):
             bg  =self._BTN_STOP_BG   if playing else self._BTN_PLAY_BG,
         )
 
+    def _edit_title(self, _event=None) -> None:
+        """タイトルラベルをダブルクリックした時にインラインで編集する。"""
+        entry = tk.Entry(self, font=("", 12, "bold"), justify=tk.CENTER)
+        entry.insert(0, self._title_var.get())
+        entry.select_range(0, tk.END)
+        # ラベルの位置に重ねて表示する
+        self._title_label.pack_forget()
+        entry.pack(pady=(2, 4), before=self._list_frame)
+        entry.focus_set()
+
+        def _commit(_e=None):
+            new_name = entry.get().strip()
+            if new_name:
+                self._title_var.set(new_name)
+            entry.destroy()
+            self._title_label.pack(pady=(2, 4), before=self._list_frame)
+
+        entry.bind("<Return>",   _commit)
+        entry.bind("<FocusOut>", _commit)
+        entry.bind("<Escape>",   lambda _e: (entry.destroy(),
+                                             self._title_label.pack(pady=(2, 4), before=self._list_frame)))
+
     def _register_rt_traces(self) -> None:
         for var in (self._az_var, self._dist_var, self._vol_var):
             var.trace_add("write", lambda *_: self._schedule_rt_update())
@@ -1362,21 +1400,41 @@ class PlayerPanel(tk.Frame):
         if not sel:
             return
 
-        # 再生中は停止確認ダイアログを出し、停止のみ行う（削除はしない）
-        if self._keep_playing or self.engine.is_playing:
-            if messagebox.askyesno(_t("dlg_stop_title"), _t("dlg_stop_msg")):
-                self._stop()
-            return
+        is_playing = self._keep_playing or self.engine.is_playing
+
+        # 再生中の項目が選択に含まれているか判定する
+        playing_selected = is_playing and self._current_idx in sel
+
+        if playing_selected:
+            # 再生中の曲を消そうとしている → 停止確認
+            if not messagebox.askyesno(_t("dlg_stop_title"), _t("dlg_stop_msg")):
+                return
+            self._stop()
+
+        # 再生中の曲のパスを覚えておく（削除後にインデックスを補正するため）
+        playing_path = None
+        if is_playing and not playing_selected and 0 <= self._current_idx < len(self._files):
+            playing_path = self._files[self._current_idx].path
 
         # 逆順に削除することでインデックスのずれを防ぐ
         for idx in sorted(sel, reverse=True):
             self._files.pop(idx)
             self._file_listbox.delete(idx)
+
         new_count = len(self._files)
         if new_count > 0:
             self._file_listbox.selection_set(min(min(sel), new_count - 1))
-        if self._current_idx >= new_count > 0:
+
+        # 再生継続中なら、再生中の曲の新しいインデックスを再特定する
+        if playing_path is not None:
+            for i, f in enumerate(self._files):
+                if f.path == playing_path:
+                    self._current_idx = i
+                    self._mark_playing(i)   # マーカー位置を更新する
+                    break
+        elif self._current_idx >= new_count > 0:
             self._current_idx = new_count - 1
+
         self._update_empty_hint()
 
     def _on_double_click(self, _event=None) -> None:
@@ -1423,14 +1481,33 @@ class PlayerPanel(tk.Frame):
         self._keep_playing = True
         self._play_index(self._current_idx)
 
+    def _mark_playing(self, idx: int) -> None:
+        """再生中の項目に背景色マーカーを付ける（選択状態とは独立）。"""
+        self._clear_playing_mark()
+        if 0 <= idx < self._file_listbox.size():
+            self._file_listbox.itemconfig(
+                idx, background="#2E7D32", foreground="white"
+            )
+        self._playing_marked_idx = idx
+
+    def _clear_playing_mark(self) -> None:
+        """再生中マーカーを解除して通常の見た目に戻す。"""
+        idx = getattr(self, "_playing_marked_idx", None)
+        if idx is not None and 0 <= idx < self._file_listbox.size():
+            try:
+                self._file_listbox.itemconfig(idx, background="", foreground="")
+            except tk.TclError:
+                pass
+        self._playing_marked_idx = None
+
     def _play_index(self, idx: int) -> None:
         if not self._files:
             self._stop()
             return
         idx = idx % len(self._files)
         self._current_idx = idx
-        self._file_listbox.selection_clear(0, tk.END)
-        self._file_listbox.selection_set(idx)
+        # 選択状態は変更せず、再生中マーカー（背景色）で示す
+        self._mark_playing(idx)
         self._file_listbox.see(idx)
 
         audio = self._files[idx]
@@ -1506,6 +1583,7 @@ class PlayerPanel(tk.Frame):
         self.engine.stop()
         self._set_button_state(playing=False)
         self._pos_canvas.clear_actual_pos()
+        self._clear_playing_mark()
 
     # ── External interface ────────────────────────────
 
@@ -1554,7 +1632,8 @@ class PlayerPanel(tk.Frame):
                 return fallback
 
         return {
-            "files":     [str(f.path) for f in self._files],
+            "files":        [str(f.path) for f in self._files],
+            "custom_title": self._title_var.get(),
             "azimuth":   self._az_var.get(),
             "distance":  self._dist_var.get(),
             "az_rnd":    self._az_rnd.get(),
@@ -1567,6 +1646,8 @@ class PlayerPanel(tk.Frame):
 
     def apply_saved(self, saved: dict) -> None:
         self._stop()
+        if "custom_title" in saved:
+            self._title_var.set(saved["custom_title"])
         default_az = DEFAULT_AZ[self.side]
         self._az_var.set(  saved.get("azimuth",   default_az))
         self._dist_var.set(saved.get("distance",  DEFAULT_DIST))

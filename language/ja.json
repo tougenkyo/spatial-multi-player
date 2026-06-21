@@ -64,5 +64,6 @@
   "ffmpeg_retry_btn": "再試行",
   "ch_count": "チャンネル数",
   "ch_label": "チャンネル",
-  "status_ch_changed": "チャンネル数を変更しました: "
+  "status_ch_changed": "チャンネル数を変更しました: ",
+  "title_edit_hint": "ダブルクリックで名前変更"
 }
