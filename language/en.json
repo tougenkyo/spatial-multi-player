@@ -65,5 +65,6 @@
   "ch_count": "Channels",
   "ch_label": "Channel",
   "status_ch_changed": "Channel count changed to ",
-  "title_edit_hint": "Double-click to rename"
+  "title_edit_hint": "Double-click to rename",
+  "wait_time": "Wait(sec)"
 }

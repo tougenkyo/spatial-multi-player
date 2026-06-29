@@ -1004,7 +1004,7 @@ DEFAULT_RND  = 0
 DEFAULT_AZ   = {"left": -45.0, "right": 45.0}
 POLL_MS      = 150
 WINDOW_SIZE  = "1040x780"
-APP_VERSION  = "1.0.5"
+APP_VERSION  = "1.0.6"
 
 
 class PlayerPanel(tk.Frame):
@@ -1044,9 +1044,13 @@ class PlayerPanel(tk.Frame):
         self._spd_var  = tk.IntVar(   value=saved.get("speed",     DEFAULT_SPD))
         self._vol_rnd  = tk.IntVar(   value=saved.get("vol_rnd",   DEFAULT_RND))
         self._spd_rnd  = tk.IntVar(   value=saved.get("spd_rnd",   DEFAULT_RND))
+        # 次の曲を再生するまでの待機時間（秒）とそのランダム変動幅
+        self._wait_var = tk.IntVar(   value=saved.get("wait",      0))
+        self._wait_rnd = tk.IntVar(   value=saved.get("wait_rnd",  0))
 
         self._vol_entry: Optional[tk.StringVar] = None  # Spinbox 表示値（保存に使う）
         self._spd_entry: Optional[tk.StringVar] = None
+        self._wait_entry: Optional[tk.StringVar] = None
 
         # チャンネル名（保存された custom_title があればそれを優先）
         self._title_var = tk.StringVar(value=saved.get("custom_title", title))
@@ -1145,6 +1149,7 @@ class PlayerPanel(tk.Frame):
 
         self._vol_entry = self._make_setting_row(right_col, _t("volume"), self._vol_var, self._vol_rnd,  0, 100, 10, 50, show_header=True)
         self._spd_entry = self._make_setting_row(right_col, _t("speed"),  self._spd_var, self._spd_rnd, 50, 200,  1, 50)
+        self._wait_entry = self._make_setting_row(right_col, _t("wait_time"), self._wait_var, self._wait_rnd, 0, 300, 1, 60)
         # 再生 / モードボタン（速度% の直下）
         btn_frame = tk.Frame(right_col)
         btn_frame.pack(fill=tk.X, pady=(6, 0))
@@ -1560,7 +1565,22 @@ class PlayerPanel(tk.Frame):
         if not self._keep_playing:
             self._set_button_state(playing=False)
             return
-        self._play_index(self._resolve_next_index())
+        # 曲が終わった → 待機時間を挟んでから次の曲へ進む
+        wait_sec = vary_int(self._wait_var.get(), self._wait_rnd.get(), 0, 300, step=1)
+        if wait_sec > 0:
+            self._status_after_wait(gen, wait_sec)
+        else:
+            self._play_index(self._resolve_next_index())
+
+    def _status_after_wait(self, gen: int, wait_sec: int) -> None:
+        """待機時間ぶん待ってから次の曲を再生する。"""
+        # 再生位置マーカーは残したまま待機する
+        delay_ms = int(wait_sec * 1000)
+        def _resume():
+            if gen != self._generation or not self._keep_playing:
+                return
+            self._play_index(self._resolve_next_index())
+        self.after(delay_ms, _resume)
 
     def _effective_settings(self) -> tuple[BinauralPosition, int, int]:
         az   = vary_float(self._az_var.get(), float(self._az_rnd.get()), -180.0, 180.0)
@@ -1616,6 +1636,10 @@ class PlayerPanel(tk.Frame):
         self._spd_var.set(DEFAULT_SPD)
         self._vol_rnd.set(DEFAULT_RND)
         self._spd_rnd.set(DEFAULT_RND)
+        self._wait_var.set(0)
+        self._wait_rnd.set(0)
+        if self._wait_entry is not None:
+            self._wait_entry.set("0")
         # 再生モードを順番再生に戻す
         self._play_mode = PlayMode.SEQUENTIAL
         cfg = self._MODE_CONFIG[self._play_mode]
@@ -1641,6 +1665,8 @@ class PlayerPanel(tk.Frame):
             "speed":     _read_entry(self._spd_entry, self._spd_var.get()),
             "vol_rnd":   self._vol_rnd.get(),
             "spd_rnd":   self._spd_rnd.get(),
+            "wait":      _read_entry(self._wait_entry, self._wait_var.get()),
+            "wait_rnd":  self._wait_rnd.get(),
             "play_mode": self._play_mode.value,
         }
 
@@ -1656,11 +1682,15 @@ class PlayerPanel(tk.Frame):
         self._spd_var.set( saved.get("speed",     DEFAULT_SPD))
         self._vol_rnd.set( saved.get("vol_rnd",   DEFAULT_RND))
         self._spd_rnd.set( saved.get("spd_rnd",   DEFAULT_RND))
+        self._wait_var.set(saved.get("wait",      0))
+        self._wait_rnd.set(saved.get("wait_rnd",  0))
         # entry_var（Spinbox 表示）も明示的に更新する
         if self._vol_entry is not None:
             self._vol_entry.set(str(saved.get("volume", DEFAULT_VOL)))
         if self._spd_entry is not None:
             self._spd_entry.set(str(saved.get("speed",  DEFAULT_SPD)))
+        if self._wait_entry is not None:
+            self._wait_entry.set(str(saved.get("wait",   0)))
         self._play_mode = PlayMode(saved.get("play_mode", PlayMode.SEQUENTIAL.value))
         cfg = self._MODE_CONFIG[self._play_mode]
         self._mode_btn.config(text=cfg["text"], bg=cfg["bg"], fg="white")

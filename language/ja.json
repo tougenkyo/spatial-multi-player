@@ -65,5 +65,6 @@
   "ch_count": "チャンネル数",
   "ch_label": "チャンネル",
   "status_ch_changed": "チャンネル数を変更しました: ",
-  "title_edit_hint": "ダブルクリックで名前変更"
+  "title_edit_hint": "ダブルクリックで名前変更",
+  "wait_time": "待機(秒)"
 }
