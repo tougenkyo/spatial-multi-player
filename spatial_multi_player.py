@@ -1044,9 +1044,9 @@ class PlayerPanel(tk.Frame):
         self._spd_var  = tk.IntVar(   value=saved.get("speed",     DEFAULT_SPD))
         self._vol_rnd  = tk.IntVar(   value=saved.get("vol_rnd",   DEFAULT_RND))
         self._spd_rnd  = tk.IntVar(   value=saved.get("spd_rnd",   DEFAULT_RND))
-        # 次の曲を再生するまでの待機時間（秒）とそのランダム変動幅
-        self._wait_var = tk.IntVar(   value=saved.get("wait",      0))
-        self._wait_rnd = tk.IntVar(   value=saved.get("wait_rnd",  0))
+        # 次の曲を再生するまでの待機時間（秒・0.1秒単位）とそのランダム変動幅
+        self._wait_var = tk.DoubleVar(value=saved.get("wait",      0.0))
+        self._wait_rnd = tk.DoubleVar(value=saved.get("wait_rnd",  0.0))
 
         self._vol_entry: Optional[tk.StringVar] = None  # Spinbox 表示値（保存に使う）
         self._spd_entry: Optional[tk.StringVar] = None
@@ -1149,7 +1149,7 @@ class PlayerPanel(tk.Frame):
 
         self._vol_entry = self._make_setting_row(right_col, _t("volume"), self._vol_var, self._vol_rnd,  0, 100, 10, 50, show_header=True)
         self._spd_entry = self._make_setting_row(right_col, _t("speed"),  self._spd_var, self._spd_rnd, 50, 200,  1, 50)
-        self._wait_entry = self._make_setting_row(right_col, _t("wait_time"), self._wait_var, self._wait_rnd, 0, 300, 1, 60)
+        self._wait_entry = self._make_setting_row(right_col, _t("wait_time"), self._wait_var, self._wait_rnd, 0, 300, 0.1, 60, is_float=True, rnd_step=0.1)
         # 再生 / モードボタン（速度% の直下）
         btn_frame = tk.Frame(right_col)
         btn_frame.pack(fill=tk.X, pady=(6, 0))
@@ -1181,7 +1181,15 @@ class PlayerPanel(tk.Frame):
     def _make_setting_row(
         self, parent, label, val_var, rnd_var,
         from_, to, val_step=10, rnd_max=50, show_header=False,
+        is_float=False, rnd_step=10,
     ) -> None:
+        # is_float=True のときは 0.1 単位の小数として扱う（待機秒など）
+        def _fmt(v) -> str:
+            return f"{float(v):.1f}" if is_float else str(int(float(v)))
+
+        def _parse(s):
+            return round(float(s), 1) if is_float else int(float(s))
+
         # 最初の行だけ列ヘッダーを表示する
         if show_header:
             hdr = tk.Frame(parent)
@@ -1201,22 +1209,22 @@ class PlayerPanel(tk.Frame):
         # Spinbox は専用の StringVar で管理する。
         # IntVar と Scale を共有すると1文字入力のたびに Scale が値を丸めてしまう。
         # from_/to は矢印ボタンの動作に必要なので渡す。確定時だけ IntVar へ書き戻す。
-        entry_var = tk.StringVar(value=str(val_var.get()))
+        entry_var = tk.StringVar(value=_fmt(val_var.get()))
 
         # Scale が変化したとき（スライダー操作）は entry_var も追従させる
         def _sync_to_entry(*_):
-            entry_var.set(str(val_var.get()))
+            entry_var.set(_fmt(val_var.get()))
         val_var.trace_add("write", _sync_to_entry)
 
         # 確定時に entry_var → val_var へクランプして書き戻す
         def _commit(_event=None):
             try:
-                v = int(float(entry_var.get()))
+                v = _parse(entry_var.get())
             except (ValueError, tk.TclError):
                 v = val_var.get()
             clamped = max(from_, min(to, v))
             val_var.set(clamped)
-            entry_var.set(str(clamped))
+            entry_var.set(_fmt(clamped))
 
         val_sb = tk.Spinbox(
             row, textvariable=entry_var,
@@ -1231,24 +1239,24 @@ class PlayerPanel(tk.Frame):
 
         tk.Label(row, text="±", font=("", 9), fg="#555").pack(side=tk.LEFT, padx=(6, 0))
 
-        rnd_entry = tk.StringVar(value=str(rnd_var.get()))
+        rnd_entry = tk.StringVar(value=_fmt(rnd_var.get()))
 
         def _sync_rnd(*_):
-            rnd_entry.set(str(rnd_var.get()))
+            rnd_entry.set(_fmt(rnd_var.get()))
         rnd_var.trace_add("write", _sync_rnd)
 
         def _commit_rnd(_event=None):
             try:
-                v = int(float(rnd_entry.get()))
+                v = _parse(rnd_entry.get())
             except (ValueError, tk.TclError):
                 v = rnd_var.get()
             clamped = max(0, min(rnd_max, v))
             rnd_var.set(clamped)
-            rnd_entry.set(str(clamped))
+            rnd_entry.set(_fmt(clamped))
 
         rnd_sb = tk.Spinbox(
             row, textvariable=rnd_entry,
-            from_=0, to=rnd_max, increment=10,
+            from_=0, to=rnd_max, increment=rnd_step,
             width=4, font=("", 9),
         )
         rnd_sb.pack(side=tk.LEFT)
@@ -1566,7 +1574,7 @@ class PlayerPanel(tk.Frame):
             self._set_button_state(playing=False)
             return
         # 曲が終わった → 待機時間を挟んでから次の曲へ進む
-        wait_sec = vary_int(self._wait_var.get(), self._wait_rnd.get(), 0, 300, step=1)
+        wait_sec = round(vary_float(self._wait_var.get(), float(self._wait_rnd.get()), 0.0, 300.0), 1)
         if wait_sec > 0:
             self._status_after_wait(gen, wait_sec)
         else:
@@ -1636,10 +1644,10 @@ class PlayerPanel(tk.Frame):
         self._spd_var.set(DEFAULT_SPD)
         self._vol_rnd.set(DEFAULT_RND)
         self._spd_rnd.set(DEFAULT_RND)
-        self._wait_var.set(0)
-        self._wait_rnd.set(0)
+        self._wait_var.set(0.0)
+        self._wait_rnd.set(0.0)
         if self._wait_entry is not None:
-            self._wait_entry.set("0")
+            self._wait_entry.set("0.0")
         # 再生モードを順番再生に戻す
         self._play_mode = PlayMode.SEQUENTIAL
         cfg = self._MODE_CONFIG[self._play_mode]
@@ -1655,6 +1663,15 @@ class PlayerPanel(tk.Frame):
             except (ValueError, tk.TclError):
                 return fallback
 
+        # 待機秒は 0.1 単位の小数として保存する
+        def _read_entry_float(entry_var: Optional[tk.StringVar], fallback: float) -> float:
+            if entry_var is None:
+                return fallback
+            try:
+                return round(float(entry_var.get()), 1)
+            except (ValueError, tk.TclError):
+                return fallback
+
         return {
             "files":        [str(f.path) for f in self._files],
             "custom_title": self._title_var.get(),
@@ -1665,8 +1682,8 @@ class PlayerPanel(tk.Frame):
             "speed":     _read_entry(self._spd_entry, self._spd_var.get()),
             "vol_rnd":   self._vol_rnd.get(),
             "spd_rnd":   self._spd_rnd.get(),
-            "wait":      _read_entry(self._wait_entry, self._wait_var.get()),
-            "wait_rnd":  self._wait_rnd.get(),
+            "wait":      _read_entry_float(self._wait_entry, self._wait_var.get()),
+            "wait_rnd":  round(float(self._wait_rnd.get()), 1),
             "play_mode": self._play_mode.value,
         }
 
@@ -1682,15 +1699,15 @@ class PlayerPanel(tk.Frame):
         self._spd_var.set( saved.get("speed",     DEFAULT_SPD))
         self._vol_rnd.set( saved.get("vol_rnd",   DEFAULT_RND))
         self._spd_rnd.set( saved.get("spd_rnd",   DEFAULT_RND))
-        self._wait_var.set(saved.get("wait",      0))
-        self._wait_rnd.set(saved.get("wait_rnd",  0))
+        self._wait_var.set(float(saved.get("wait",      0.0)))
+        self._wait_rnd.set(float(saved.get("wait_rnd",  0.0)))
         # entry_var（Spinbox 表示）も明示的に更新する
         if self._vol_entry is not None:
             self._vol_entry.set(str(saved.get("volume", DEFAULT_VOL)))
         if self._spd_entry is not None:
             self._spd_entry.set(str(saved.get("speed",  DEFAULT_SPD)))
         if self._wait_entry is not None:
-            self._wait_entry.set(str(saved.get("wait",   0)))
+            self._wait_entry.set(f"{float(saved.get('wait', 0.0)):.1f}")
         self._play_mode = PlayMode(saved.get("play_mode", PlayMode.SEQUENTIAL.value))
         cfg = self._MODE_CONFIG[self._play_mode]
         self._mode_btn.config(text=cfg["text"], bg=cfg["bg"], fg="white")
@@ -1741,6 +1758,8 @@ class StereoWavPlayerApp:
         self._root.resizable(True, True)
 
         self._last_save_path: Optional[Path] = None
+        # ロード/セーブダイアログを最後に参照したフォルダから開くために記憶する
+        self._last_dir: str = saved.get("last_dir", "")
         self._panels: list[PlayerPanel] = []
         self._closing = False  # 終了処理中は全コールバックを無効化する
         self._ch_count = int(saved.get("ch_count", self._DEFAULT_CH))
@@ -2104,6 +2123,7 @@ class StereoWavPlayerApp:
             "lang":     _CURRENT_LANG,
             "theme":    _CURRENT_THEME,
             "ch_count": len(self._panels),
+            "last_dir": self._last_dir,
             "channels": [p.get_save_data() for p in self._panels],
         }
 
@@ -2112,10 +2132,13 @@ class StereoWavPlayerApp:
             title=_t("btn_save"), defaultextension=".json",
             filetypes=[("JSON", "*.json"), ("*", "*.*")],
             initialfile="spatial_multi_player_setting.json",
+            initialdir=self._last_dir or None,
         )
         if not path_str:
             return
         path = Path(path_str)
+        # 次回のダイアログのために参照フォルダを記憶する
+        self._last_dir = str(path.parent)
         ok = save_settings_to(path, self._collect_data())
         if ok:
             self._last_save_path = path
@@ -2140,9 +2163,12 @@ class StereoWavPlayerApp:
         path_str = filedialog.askopenfilename(
             title=_t("btn_load"),
             filetypes=[("JSON", "*.json"), ("*", "*.*")],
+            initialdir=self._last_dir or None,
         )
         if not path_str:
             return
+        # 次回のダイアログのために参照フォルダを記憶する
+        self._last_dir = str(Path(path_str).parent)
         data = load_settings_from(Path(path_str))
         if not data:
             messagebox.showwarning(_t("dlg_load_warn"), _t("dlg_load_warn_msg"))
